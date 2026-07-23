@@ -1,0 +1,797 @@
+     1→"""
+     2→main.py — LiftUp SaaS Multi-Tenant FastAPI Application
+     3→========================================================
+     4→Architecture:
+     5→  ┌─────────────────────────────────────────────────────────┐
+     6→  │  Widget Request (X-API-Key header)                      │
+     7→  │        │                                                │
+     8→  │        ▼                                                │
+     9→  │  [TenantAuthMiddleware]  ←── Validates API key          │
+    10→  │        │                     Loads restaurant + sub     │
+    11→  │        ▼                     Attaches to request.state  │
+    12→  │  [QuotaEnforcementDep]   ←── Checks billing quota       │
+    13→  │        │                     Blocks if exhausted        │
+    14→  │        ▼                                                │
+    15→  │  Route Handler            ←── Uses request.state.tenant │
+    16→  └─────────────────────────────────────────────────────────┘
+    17→
+    18→Security layers:
+    19→  1. API key validation (database lookup via unique index)
+    20→  2. Tenant data on request.state (never from client body)
+    21→  3. All DB queries pass restaurant_id from request.state
+    22→  4. RLS session variable set in TenantConn context
+    23→  5. Rate limiting per IP (slowapi)
+    24→  6. Twilio HMAC-SHA1 signature validation on /webhooks/sms
+    25→
+    26→Background services (lifespan):
+    27→  • APScheduler — fires _run_billing_cycle_resets() every 24 h
+    28→    Finds subscriptions where billing_cycle_end <= NOW() and calls
+    29→    fn_reset_billing_cycle() to zero the counter and push the window
+    30→    forward 30 days.  Runs once immediately on startup to catch any
+    31→    cycles that expired while the server was down.
+    32→
+    33→Inbound SMS (POST /webhooks/sms):
+    34→  • Registered as the Twilio SmsUrl when a number is provisioned
+    35→  • Validates Twilio signature before processing
+    36→  • Appends the message to the customer's active conversation session
+    37→  • Forwards the text to the restaurant owner via email
+    38→  • Returns empty TwiML <Response/> (no auto-reply)
+    39→"""
+    40→
+    41→import logging
+    42→import secrets
+    43→import hashlib
+    44→import hmac
+    45→import asyncio
+    46→from datetime import date, time as time_type
+    47→from typing import Optional
+    48→from contextlib import asynccontextmanager
+    49→from uuid import UUID
+    50→
+    51→import uvicorn
+    52→from fastapi import (
+    53→    FastAPI, HTTPException, Depends, Request, status,
+    54→    BackgroundTasks, Header, Form
+    55→)
+    56→from fastapi.middleware.cors import CORSMiddleware
+    57→from fastapi.responses import JSONResponse, Response
+    58→from pydantic import BaseModel, EmailStr, Field, validator
+    59→from slowapi import Limiter, _rate_limit_exceeded_handler
+    60→from slowapi.util import get_remote_address
+    61→from slowapi.errors import RateLimitExceeded
+    62→from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    63→from apscheduler.triggers.interval import IntervalTrigger
+    64→
+    65→from config import settings
+    66→from database import (
+    67→    get_pool, close_pool,
+    68→    get_restaurant_by_api_key,
+    69→    get_or_create_session,
+    70→    update_session,
+    71→    get_available_time_slots,
+    72→    get_reservation_by_code,
+    73→    cancel_reservation as db_cancel,
+    74→    check_and_enforce_quota,
+    75→    mark_quota_exhausted,
+    76→    send_quota_warning,
+    77→)
+    78→from agent import AgentContext, run_agent, sanitize_conversation_history
+    79→
+    80→logging.basicConfig(
+    81→    level=logging.INFO,
+    82→    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    83→)
+    84→logger = logging.getLogger(__name__)
+    85→
+    86→# =============================================================================
+    87→# Lifespan & App Init
+    88→# =============================================================================
+    89→
+    90→async def _run_billing_cycle_resets() -> None:
+    91→    """
+    92→    APScheduler job — runs every 24 hours.
+    93→
+    94→    Finds every paid subscription whose 30-day billing window has expired
+    95→    and calls the PostgreSQL function that zeros the counter and opens a
+    96→    fresh cycle. The DB function is idempotent so re-running it on an
+    97→    already-reset subscription is harmless.
+    98→
+    99→    Restaurants on the 'trial' tier are intentionally skipped — their
+   100→    counters are lifetime totals, not rolling windows.
+   101→    """
+   102→    pool = await get_pool()
+   103→    async with pool.acquire() as conn:
+   104→        expired_rows = await conn.fetch(
+   105→            """
+   106→            SELECT restaurant_id
+   107→            FROM   subscriptions
+   108→            WHERE  is_current        = TRUE
+   109→              AND  tier             != 'trial'
+   110→              AND  billing_cycle_end <= NOW()
+   111→            """
+   112→        )
+   113→
+   114→    if not expired_rows:
+   115→        logger.debug("Billing reset job: no expired cycles found.")
+   116→        return
+   117→
+   118→    logger.info(f"Billing reset job: resetting {len(expired_rows)} expired cycle(s).")
+   119→
+   120→    async with pool.acquire() as conn:
+   121→        for row in expired_rows:
+   122→            rid = row["restaurant_id"]
+   123→            try:
+   124→                # fn_reset_billing_cycle zeros the counter, pushes cycle_end
+   125→                # forward 30 days, and sets status back to 'active'.
+   126→                await conn.execute("SELECT fn_reset_billing_cycle($1)", rid)
+   127→                logger.info(f"Billing cycle reset: restaurant {rid}")
+   128→            except Exception as exc:
+   129→                # Log and continue — one failure must not block the rest
+   130→                logger.exception(f"Billing cycle reset FAILED for {rid}: {exc}")
+   131→
+   132→
+   133→@asynccontextmanager
+   134→async def lifespan(app: FastAPI):
+   135→    logger.info("LiftUp SaaS starting — initializing DB pool...")
+   136→    await get_pool()
+   137→
+   138→    # ── Start billing-cycle reset scheduler ──────────────────────────────
+   139→    import datetime as _dt
+   140→    scheduler = AsyncIOScheduler(timezone="UTC")
+   141→    scheduler.add_job(
+   142→        _run_billing_cycle_resets,
+   143→        trigger=IntervalTrigger(hours=24),
+   144→        id="billing_cycle_reset",
+   145→        name="30-day billing cycle reset",
+   146→        replace_existing=True,
+   147→        # Fire once immediately at startup so a freshly-deployed server
+   148→        # catches any cycles that expired while it was down.
+   149→        next_run_time=_dt.datetime.utcnow(),
+   150→    )
+   151→    scheduler.start()
+   152→    logger.info("APScheduler started — billing reset job fires every 24 h.")
+   153→
+   154→    yield
+   155→
+   156→    # ── Graceful shutdown ─────────────────────────────────────────────────
+   157→    scheduler.shutdown(wait=False)
+   158→    logger.info("APScheduler stopped.")
+   159→    logger.info("Shutting down — closing DB pool...")
+   160→    await close_pool()
+   161→
+   162→
+   163→limiter = Limiter(key_func=get_remote_address)
+   164→
+   165→app = FastAPI(
+   166→    title="LiftUp SaaS — Restaurant Reservation Platform API",
+   167→    version="2.0.0",
+   168→    lifespan=lifespan,
+   169→    docs_url="/docs" if settings.DEBUG else None,
+   170→    redoc_url=None,
+   171→)
+   172→
+   173→app.state.limiter = limiter
+   174→app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+   175→
+   176→app.add_middleware(
+   177→    CORSMiddleware,
+   178→    allow_origins=["*"],   # Widget is embedded on arbitrary domains
+   179→    allow_credentials=False,
+   180→    allow_methods=["GET", "POST", "PUT", "DELETE"],
+   181→    allow_headers=["Content-Type", "X-Api-Key", "X-Session-Token"],
+   182→    expose_headers=["X-Session-Token"],
+   183→)
+   184→
+   185→
+   186→# =============================================================================
+   187→# Tenant Authentication Middleware
+   188→# =============================================================================
+   189→
+   190→@app.middleware("http")
+   191→async def tenant_auth_middleware(request: Request, call_next):
+   192→    """
+   193→    Intercepts every /api/widget/* request. Validates the restaurant API key,
+   194→    loads the full tenant + subscription record, and attaches it to
+   195→    request.state.tenant so downstream handlers never need to re-query.
+   196→
+   197→    Routes NOT requiring tenant auth (owner dashboard, onboarding, health)
+   198→    are exempted explicitly.
+   199→    """
+   200→    EXEMPT_PATHS = {"/health", "/docs", "/openapi.json", "/api/onboarding",
+   201→                   "/api/auth/login", "/api/auth/register", "/api/billing/webhook",
+   202→                   "/webhooks/sms"}
+   203→
+   204→    if request.url.path in EXEMPT_PATHS or not request.url.path.startswith("/api/widget"):
+   205→        return await call_next(request)
+   206→
+   207→    api_key = request.headers.get("X-Api-Key", "").strip()
+   208→
+   209→    if not api_key:
+   210→        return JSONResponse(
+   211→            status_code=401,
+   212→            content={"detail": "Missing X-Api-Key header.", "code": "AUTH_MISSING"},
+   213→        )
+   214→
+   215→    # Constant-time comparison is not needed here since we do a DB lookup,
+   216→    # but we hash the key before the lookup to avoid timing side-channels
+   217→    # (the DB index on api_key handles the comparison securely).
+   218→    restaurant_data = await get_restaurant_by_api_key(api_key)
+   219→
+   220→    if not restaurant_data:
+   221→        logger.warning(f"Invalid API key attempt: {api_key[:8]}...")
+   222→        return JSONResponse(
+   223→            status_code=401,
+   224→            content={"detail": "Invalid API key.", "code": "AUTH_INVALID"},
+   225→        )
+   226→
+   227→    # Attach tenant data — downstream code reads from here, never from headers
+   228→    request.state.tenant          = restaurant_data
+   229→    request.state.restaurant_id   = restaurant_data["id"]
+   230→    request.state.restaurant_name = restaurant_data["restaurant_name"]
+   231→
+   232→    response = await call_next(request)
+   233→    return response
+   234→
+   235→
+   236→# =============================================================================
+   237→# Billing / Quota Enforcement Dependency
+   238→# =============================================================================
+   239→
+   240→async def enforce_quota(request: Request) -> None:
+   241→    """
+   242→    FastAPI dependency that enforces billing quota before any booking action.
+   243→
+   244→    Inject as: Depends(enforce_quota)
+   245→
+   246→    Checks:
+   247→      - Trial quota (100 reservations lifetime)
+   248→      - Monthly quota for paid plans
+   249→      - Sends async warning notifications at 80% and 95% usage
+   250→    """
+   251→    tenant = request.state.tenant
+   252→    restaurant_id = request.state.restaurant_id
+   253→
+   254→    quota = await check_and_enforce_quota(tenant)
+   255→
+   256→    if not quota["allowed"]:
+   257→        reason = quota["reason"]
+   258→        logger.warning(
+   259→            f"Quota blocked: restaurant={restaurant_id}, reason={reason}"
+   260→        )
+   261→        # Mark as exhausted in DB (idempotent)
+   262→        await mark_quota_exhausted(restaurant_id, reason)
+   263→
+   264→        messages = {
+   265→            "trial_exhausted": (
+   266→                "Your free trial of 100 reservations has been used. "
+   267→                "Please upgrade to the Starter plan ($299/month) to continue accepting bookings."
+   268→            ),
+   269→            "quota_exceeded": (
+   270→                "Your monthly reservation quota has been reached. "
+   271→                "Please contact support or recharge your plan to restore service."
+   272→            ),
+   273→            "payment_failed": (
+   274→                "There is an issue with your payment method. "
+   275→                "Please update your billing details to restore service."
+   276→            ),
+   277→        }
+   278→        raise HTTPException(
+   279→            status_code=402,
+   280→            detail={
+   281→                "code":    reason.upper(),
+   282→                "message": messages.get(reason, "Service temporarily unavailable."),
+   283→                "upgrade_url": f"{settings.PLATFORM_URL}/dashboard/billing",
+   284→            },
+   285→        )
+   286→
+   287→    # Async quota warnings (fire and forget — don't block the request)
+   288→    remaining = quota["reservations_remaining"]
+   289→    total     = (
+   290→        tenant["trial_limit"] if tenant["tier"] == "trial"
+   291→        else tenant["cycle_reservation_limit"]
+   292→    )
+   293→    pct_used  = ((total - remaining) / total * 100) if total > 0 else 0
+   294→
+   295→    if pct_used >= 95 and not tenant.get("warned_at_95_pct"):
+   296→        asyncio.create_task(send_quota_warning(restaurant_id, 95))
+   297→    elif pct_used >= 80 and not tenant.get("warned_at_80_pct"):
+   298→        asyncio.create_task(send_quota_warning(restaurant_id, 80))
+   299→
+   300→
+   301→# =============================================================================
+   302→# Pydantic Models
+   303→# =============================================================================
+   304→
+   305→class ChatRequest(BaseModel):
+   306→    message:       str = Field(..., min_length=1, max_length=2000)
+   307→    session_token: Optional[str] = None
+   308→
+   309→    @validator("message")
+   310→    def sanitize(cls, v):
+   311→        return " ".join(v.split())
+   312→
+   313→
+   314→class ChatResponse(BaseModel):
+   315→    reply:             str
+   316→    session_token:     str
+   317→    booking_complete:  bool          = False
+   318→    confirmation_code: Optional[str] = None
+   319→
+   320→
+   321→class CancelRequest(BaseModel):
+   322→    email: EmailStr
+   323→
+   324→
+   325→class ModifyRequest(BaseModel):
+   326→    email:          EmailStr
+   327→    new_date:       Optional[date]     = None
+   328→    new_time:       Optional[str]      = None
+   329→    new_party_size: Optional[int]      = None
+   330→
+   331→
+   332→# =============================================================================
+   333→# Session Token Helper
+   334→# =============================================================================
+   335→
+   336→async def get_session(request: Request) -> dict:
+   337→    token = request.headers.get("X-Session-Token", "")
+   338→    if not token or len(token) < 16:
+   339→        token = secrets.token_urlsafe(32)
+   340→    session = await get_or_create_session(
+   341→        restaurant_id=request.state.restaurant_id,
+   342→        session_token=token,
+   343→    )
+   344→    session["_token"] = token
+   345→    return session
+   346→
+   347→
+   348→# =============================================================================
+   349→# Widget API Routes (require tenant auth + quota)
+   350→# =============================================================================
+   351→
+   352→@app.post(
+   353→    "/api/widget/chat",
+   354→    response_model=ChatResponse,
+   355→    tags=["Widget — AI Agent"],
+   356→)
+   357→@limiter.limit("30/minute")
+   358→async def widget_chat(
+   359→    request:    Request,
+   360→    body:       ChatRequest,
+   361→    _quota:     None = Depends(enforce_quota),
+   362→    session:    dict = Depends(get_session),
+   363→):
+   364→    """
+   365→    Primary AI conversation endpoint for embedded widgets.
+   366→    Requires X-Api-Key (widget key) in headers.
+   367→    """
+   368→    token         = session["_token"]
+   369→    restaurant_id = request.state.restaurant_id
+   370→
+   371→    # Hydrate agent context from session + restaurant profile
+   372→    # Sanitize history to repair any corrupted content blocks from
+   373→    # sessions created before the _serialize_content_block fix.
+   374→    raw_history = session.get("messages", [])
+   375→    safe_history = sanitize_conversation_history(raw_history)
+   376→
+   377→    ctx = AgentContext(
+   378→        restaurant_id=restaurant_id,
+   379→        restaurant_name=request.state.restaurant_name,
+   380→        restaurant_data=request.state.tenant,
+   381→        conversation_history=safe_history,
+   382→        booking_context=session.get("context", {}),
+   383→    )
+   384→
+   385→    try:
+   386→        reply, updated_ctx = await run_agent(body.message, ctx)
+   387→    except Exception as e:
+   388→        logger.exception(f"Agent error [{restaurant_id}]: {e}")
+   389→        raise HTTPException(
+   390→            status_code=500,
+   391→            detail="The reservation assistant encountered an error. Please try again.",
+   392→        )
+   393→
+   394→    await update_session(
+   395→        restaurant_id=restaurant_id,
+   396→        session_token=token,
+   397→        messages=updated_ctx.conversation_history,
+   398→        context=updated_ctx.booking_context,
+   399→        customer_id=updated_ctx.booking_context.get("customer_id"),
+   400→        reservation_id=updated_ctx.booking_context.get("reservation_id"),
+   401→    )
+   402→
+   403→    return ChatResponse(
+   404→        reply=reply,
+   405→        session_token=token,
+   406→        booking_complete=updated_ctx.booking_context.get("booking_complete", False),
+   407→        confirmation_code=updated_ctx.booking_context.get("confirmation_code"),
+   408→    )
+   409→
+   410→
+   411→@app.get(
+   412→    "/api/widget/availability",
+   413→    tags=["Widget — Availability"],
+   414→)
+   415→@limiter.limit("60/minute")
+   416→async def widget_availability(
+   417→    request:    Request,
+   418→    date:       date,
+   419→    party_size: int,
+   420→    preference: Optional[str] = "no_preference",
+   421→    _quota:     None = Depends(enforce_quota),
+   422→):
+   423→    """Returns available time slots for a date picker (read-only, no booking)."""
+   424→    slots = await get_available_time_slots(
+   425→        restaurant_id=request.state.restaurant_id,
+   426→        reservation_date=date,
+   427→        party_size=party_size,
+   428→        preference=preference,
+   429→    )
+   430→    return {
+   431→        "restaurant": request.state.restaurant_name,
+   432→        "date": str(date),
+   433→        "party_size": party_size,
+   434→        "available_slots": slots,
+   435→    }
+   436→
+   437→
+   438→@app.get(
+   439→    "/api/widget/reservations/{code}",
+   440→    tags=["Widget — Reservations"],
+   441→)
+   442→@limiter.limit("20/minute")
+   443→async def widget_get_reservation(
+   444→    request: Request,
+   445→    code:    str,
+   446→):
+   447→    """Fetch reservation — always scoped to the authenticated restaurant."""
+   448→    reservation = await get_reservation_by_code(
+   449→        request.state.restaurant_id, code.upper()
+   450→    )
+   451→    if not reservation:
+   452→        raise HTTPException(404, f"Reservation '{code}' not found.")
+   453→
+   454→    return {
+   455→        "confirmation_code": reservation["confirmation_code"],
+   456→        "customer_name":     reservation["full_name"],
+   457→        "reservation_date":  str(reservation["reservation_date"]),
+   458→        "start_time":        str(reservation["start_time"])[:5],
+   459→        "party_size":        reservation["party_size"],
+   460→        "table_number":      reservation["table_number"],
+   461→        "status":            reservation["status"],
+   462→        "special_requests":  reservation.get("special_requests"),
+   463→    }
+   464→
+   465→
+   466→@app.delete(
+   467→    "/api/widget/reservations/{code}",
+   468→    tags=["Widget — Reservations"],
+   469→)
+   470→@limiter.limit("10/minute")
+   471→async def widget_cancel_reservation(
+   472→    request: Request,
+   473→    code:    str,
+   474→    body:    CancelRequest,
+   475→):
+   476→    try:
+   477→        result = await db_cancel(
+   478→            restaurant_id=request.state.restaurant_id,
+   479→            code=code.upper(),
+   480→            customer_email=body.email,
+   481→        )
+   482→        return {"success": True, "cancelled_code": result["confirmation_code"]}
+   483→    except ValueError as e:
+   484→        raise HTTPException(400, str(e))
+   485→
+   486→
+   487→@app.put(
+   488→    "/api/widget/reservations/{code}",
+   489→    tags=["Widget — Reservations"],
+   490→)
+   491→@limiter.limit("10/minute")
+   492→async def widget_modify_reservation(
+   493→    request: Request,
+   494→    code:    str,
+   495→    body:    ModifyRequest,
+   496→):
+   497→    from database import modify_reservation
+   498→    try:
+   499→        new_time = time_type.fromisoformat(body.new_time) if body.new_time else None
+   500→        result = await modify_reservation(
+   501→            restaurant_id=request.state.restaurant_id,
+   502→            code=code.upper(),
+   503→            customer_email=body.email,
+   504→            new_date=body.new_date,
+   505→            new_time=new_time,
+   506→            new_party_size=body.new_party_size,
+   507→        )
+   508→        return {
+   509→            "success": True,
+   510→            "old_code": code.upper(),
+   511→            "new_confirmation_code": result["confirmation_code"],
+   512→        }
+   513→    except ValueError as e:
+   514→        raise HTTPException(400, str(e))
+   515→
+   516→
+   517→# =============================================================================
+   518→# Twilio Inbound SMS Webhook  ·  POST /webhooks/sms
+   519→# =============================================================================
+   520→# Twilio calls this URL (configured per-number during provisioning) whenever
+   521→# a customer replies to a restaurant's SMS confirmation.
+   522→#
+   523→# Security: Every request is validated using Twilio's HMAC-SHA1 signature
+   524→# scheme before any business logic runs.  Requests that fail validation are
+   525→# rejected with 403 so random internet traffic cannot inject fake messages.
+   526→#
+   527→# Flow:
+   528→#   1. Validate Twilio signature
+   529→#   2. Identify the restaurant via the "To" number (the dedicated sender)
+   530→#   3. Identify the customer via "From" (their mobile number)
+   531→#   4. Persist the message to conversation_sessions (latest active session)
+   532→#      or to a standalone inbound_sms_log fallback
+   533→#   5. Forward a notification email to the restaurant owner
+   534→#   6. Return empty TwiML <Response/> — no auto-reply by default
+   535→# =============================================================================
+   536→
+   537→def _validate_twilio_signature(request_url: str, post_params: dict, signature: str) -> bool:
+   538→    """
+   539→    Validates the X-Twilio-Signature header using HMAC-SHA1.
+   540→    See: https://www.twilio.com/docs/usage/webhooks/webhooks-security
+   541→    """
+   542→    # Build the validation string: URL + sorted POST params concatenated
+   543→    s = request_url + "".join(f"{k}{v}" for k, v in sorted(post_params.items()))
+   544→    expected = hmac.new(
+   545→        settings.TWILIO_AUTH_TOKEN.encode(),
+   546→        s.encode(),
+   547→        "sha1",
+   548→    ).digest()
+   549→    import base64
+   550→    expected_b64 = base64.b64encode(expected).decode()
+   551→    # Constant-time comparison to prevent timing attacks
+   552→    return hmac.compare_digest(expected_b64, signature)
+   553→
+   554→
+   555→async def _get_restaurant_by_phone(to_number: str):
+   556→    """Resolves inbound Twilio 'To' number → restaurant row."""
+   557→    pool = await get_pool()
+   558→    async with pool.acquire() as conn:
+   559→        return await conn.fetchrow(
+   560→            """
+   561→            SELECT r.id, r.restaurant_name, r.owner_email, r.owner_name
+   562→            FROM   restaurant_phone_numbers p
+   563→            JOIN   restaurants r ON r.id = p.restaurant_id
+   564→            WHERE  p.phone_number = $1 AND p.is_active = TRUE
+   565→            """,
+   566→            to_number,
+   567→        )
+   568→
+   569→
+   570→async def _append_to_session(restaurant_id, from_number: str, body: str) -> bool:
+   571→    """
+   572→    Appends the inbound SMS as a new message in the customer's most recent
+   573→    active conversation session (matched by phone number).
+   574→    Returns True if a matching session was found and updated.
+   575→    """
+   576→    import json as _json
+   577→    pool = await get_pool()
+   578→    async with pool.acquire() as conn:
+   579→        # Find the most recent active session for this phone number
+   580→        session_row = await conn.fetchrow(
+   581→            """
+   582→            SELECT cs.id, cs.messages
+   583→            FROM   conversation_sessions cs
+   584→            JOIN   customers c ON c.id = cs.customer_id
+   585→            WHERE  cs.restaurant_id = $1
+   586→              AND  c.phone          = $2
+   587→              AND  cs.is_active     = TRUE
+   588→              AND  cs.expires_at    > NOW()
+   589→            ORDER BY cs.last_active_at DESC
+   590→            LIMIT 1
+   591→            """,
+   592→            restaurant_id, from_number,
+   593→        )
+   594→        if not session_row:
+   595→            return False
+   596→
+   597→        current_messages = session_row["messages"] or []
+   598→        current_messages.append({
+   599→            "role":    "user",
+   600→            "content": f"[SMS reply]: {body}",
+   601→            "via":     "sms_inbound",
+   602→        })
+   603→
+   604→        await conn.execute(
+   605→            """
+   606→            UPDATE conversation_sessions
+   607→            SET    messages       = $2::jsonb,
+   608→                   last_active_at = NOW()
+   609→            WHERE  id = $1
+   610→            """,
+   611→            session_row["id"],
+   612→            _json.dumps(current_messages),
+   613→        )
+   614→        return True
+   615→
+   616→
+   617→async def _log_inbound_sms(restaurant_id, from_number: str, to_number: str, body: str) -> None:
+   618→    """
+   619→    Fallback: writes the message to notification_log as an inbound record
+   620→    when no matching session exists (e.g., customer texts days later).
+   621→    Uses a synthetic reservation_id of NULL via a raw insert.
+   622→    """
+   623→    pool = await get_pool()
+   624→    async with pool.acquire() as conn:
+   625→        # notification_log requires a reservation_id FK — use a separate
+   626→        # lightweight table if available, otherwise just log to server logs.
+   627→        # For now we write to a catch-all row identified by channel='sms_inbound'.
+   628→        try:
+   629→            await conn.execute(
+   630→                """
+   631→                INSERT INTO notification_log
+   632→                    (restaurant_id, reservation_id, channel, recipient,
+   633→                     template_name, status, provider_id)
+   634→                SELECT $1, r.id, 'sms'::notification_channel, $2,
+   635→                       'inbound_sms', 'sent'::notification_status, $3
+   636→                FROM   reservations r
+   637→                WHERE  r.restaurant_id = $1
+   638→                  AND  r.status        = 'confirmed'
+   639→                ORDER BY r.created_at DESC
+   640→                LIMIT 1
+   641→                """,
+   642→                restaurant_id, from_number, f"FROM:{from_number} BODY:{body[:100]}",
+   643→            )
+   644→        except Exception:
+   645→            # Non-critical — the important notification is the owner email below
+   646→            logger.warning(f"Could not write inbound SMS to notification_log for {restaurant_id}")
+   647→
+   648→
+   649→async def _notify_owner_of_inbound_sms(
+   650→    owner_email: str,
+   651→    owner_name: str,
+   652→    restaurant_name: str,
+   653→    from_number: str,
+   654→    body: str,
+   655→) -> None:
+   656→    """Sends a quick email to the restaurant owner forwarding the customer's reply."""
+   657→    from notifications import _send_email
+   658→    html = f"""
+   659→    <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;
+   660→                padding:24px;border:1px solid #e0e0e0;border-radius:8px">
+   661→      <h3 style="color:#1a3a2a;margin-top:0">📱 New SMS reply from a guest</h3>
+   662→      <p><strong>Restaurant:</strong> {restaurant_name}</p>
+   663→      <p><strong>From:</strong> {from_number}</p>
+   664→      <div style="background:#f5f5f5;border-left:4px solid #1a3a2a;
+   665→                  padding:12px 16px;border-radius:0 4px 4px 0;
+   666→                  font-size:16px;margin:16px 0">
+   667→        "{body}"
+   668→      </div>
+   669→      <p style="color:#666;font-size:12px">
+   670→        This message was sent to your dedicated LiftUp reservation number.
+   671→        Reply directly to the customer at {from_number}.
+   672→      </p>
+   673→    </div>
+   674→    """
+   675→    await _send_email(
+   676→        to_email=owner_email,
+   677→        to_name=owner_name,
+   678→        subject=f"📱 Guest SMS reply — {restaurant_name}",
+   679→        html_body=html,
+   680→        plain_body=f"New SMS from {from_number}:\n\n\"{body}\"\n\nReply at: {from_number}",
+   681→        from_name="LiftUp Notifications",
+   682→        template_name="inbound_sms_forward",
+   683→    )
+   684→
+   685→
+   686→@app.post(
+   687→    "/webhooks/sms",
+   688→    tags=["Webhooks"],
+   689→    summary="Twilio inbound SMS webhook",
+   690→    include_in_schema=False,   # Hide from public docs
+   691→)
+   692→@limiter.limit("120/minute")   # Twilio can burst — allow generous headroom
+   693→async def twilio_sms_webhook(
+   694→    request:          Request,
+   695→    background_tasks: BackgroundTasks,
+   696→    # Twilio sends application/x-www-form-urlencoded — use Form()
+   697→    From:    str = Form(...),   # Customer's mobile number (E.164)
+   698→    To:      str = Form(...),   # Restaurant's dedicated number (E.164)
+   699→    Body:    str = Form(""),    # Message text (may be empty for media-only MMS)
+   700→    MessageSid: str = Form(...),
+   701→):
+   702→    """
+   703→    Receives inbound SMS from Twilio.
+   704→
+   705→    Twilio delivers a POST with form-encoded fields:
+   706→      From       — the customer's number
+   707→      To         — the restaurant's dedicated number
+   708→      Body       — the message text
+   709→      MessageSid — Twilio's unique ID for idempotency checks
+   710→
+   711→    Security: The X-Twilio-Signature header is validated against our
+   712→    auth token before any processing occurs.
+   713→    """
+   714→    # ── 1. Validate Twilio signature ──────────────────────────────────────
+   715→    signature = request.headers.get("X-Twilio-Signature", "")
+   716→    if not settings.DEBUG:   # Skip in local dev (no public URL for Twilio to sign)
+   717→        form_data  = dict(await request.form())
+   718→        public_url = str(request.url).replace("http://", "https://")
+   719→        if not _validate_twilio_signature(public_url, form_data, signature):
+   720→            logger.warning(
+   721→                f"Twilio signature validation FAILED for {MessageSid} "
+   722→                f"from {From} — possible spoofed request."
+   723→            )
+   724→            # Return 403 but still return valid XML so Twilio doesn't keep retrying
+   725→            return Response(
+   726→                content='<?xml version="1.0"?><Response/>',
+   727→                media_type="application/xml",
+   728→                status_code=403,
+   729→            )
+   730→
+   731→    logger.info(f"Inbound SMS: {MessageSid} | From={From} To={To} | Body={Body[:80]!r}")
+   732→
+   733→    # ── 2. Resolve restaurant from 'To' number ────────────────────────────
+   734→    restaurant_row = await _get_restaurant_by_phone(To)
+   735→    if not restaurant_row:
+   736→        logger.warning(f"Inbound SMS to unknown number {To} — no restaurant mapped.")
+   737→        return Response(
+   738→            content='<?xml version="1.0"?><Response/>',
+   739→            media_type="application/xml",
+   740→        )
+   741→
+   742→    restaurant_id   = restaurant_row["id"]
+   743→    body_text       = Body.strip()
+   744→
+   745→    # ── 3. Persist message (session append, or fallback log) ──────────────
+   746→    appended = await _append_to_session(restaurant_id, From, body_text)
+   747→    if not appended:
+   748→        # No live session — log it so it's not silently discarded
+   749→        background_tasks.add_task(_log_inbound_sms, restaurant_id, From, To, body_text)
+   750→
+   751→    # ── 4. Forward to restaurant owner (background — non-blocking) ────────
+   752→    background_tasks.add_task(
+   753→        _notify_owner_of_inbound_sms,
+   754→        owner_email=restaurant_row["owner_email"],
+   755→        owner_name=restaurant_row["owner_name"],
+   756→        restaurant_name=restaurant_row["restaurant_name"],
+   757→        from_number=From,
+   758→        body=body_text or "(no text — possible media message)",
+   759→    )
+   760→
+   761→    # ── 5. Return empty TwiML — no auto-reply ─────────────────────────────
+   762→    # Returning a non-empty <Message> here would auto-reply to the customer.
+   763→    # For now we stay silent and let the owner decide how to respond.
+   764→    return Response(
+   765→        content='<?xml version="1.0"?><Response/>',
+   766→        media_type="application/xml",
+   767→    )
+   768→
+   769→
+   770→# =============================================================================
+   771→# System Routes
+   772→# =============================================================================
+   773→
+   774→@app.get("/health", tags=["System"])
+   775→async def health():
+   776→    pool = await get_pool()
+   777→    async with pool.acquire() as conn:
+   778→        await conn.fetchval("SELECT 1")
+   779→    return {"status": "healthy", "service": "LiftUp SaaS v2"}
+   780→
+   781→
+   782→@app.exception_handler(Exception)
+   783→async def global_handler(request: Request, exc: Exception):
+   784→    logger.exception(f"Unhandled: {request.url} — {exc}")
+   785→    return JSONResponse(
+   786→        status_code=500,
+   787→        content={"detail": "Internal server error."},
+   788→    )
+   789→
+   790→
+   791→# =============================================================================
+   792→# Entry Point
+   793→# =============================================================================
+   794→
+   795→if __name__ == "__main__":
+   796→    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=settings.DEBUG)
+   797→

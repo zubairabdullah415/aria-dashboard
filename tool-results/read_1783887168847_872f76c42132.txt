@@ -1,0 +1,896 @@
+     1→"use client";
+     2→
+     3→import { useCallback, useEffect, useRef, useState } from "react";
+     4→import {
+     5→  Send,
+     6→  Wifi,
+     7→  WifiOff,
+     8→  RefreshCw,
+     9→  Copy,
+    10→  Check,
+    11→  Trash2,
+    12→  Zap,
+    13→  Bot,
+    14→  User,
+    15→  ChevronDown,
+    16→  ChevronRight,
+    17→  KeyRound,
+    18→  Fingerprint,
+    19→  Server,
+    20→  Sparkles,
+    21→} from "lucide-react";
+    22→import { Button } from "@/components/ui/button";
+    23→import { Input } from "@/components/ui/input";
+    24→import { Badge } from "@/components/ui/badge";
+    25→import { ScrollArea } from "@/components/ui/scroll-area";
+    26→import { Separator } from "@/components/ui/separator";
+    27→import { toast } from "sonner";
+    28→
+    29→// ─── Types ──────────────────────────────────────────────────────────────────
+    30→
+    31→interface ChatMessage {
+    32→  id: string;
+    33→  role: "user" | "assistant";
+    34→  content: string;
+    35→  timestamp: Date;
+    36→  booking_complete?: boolean;
+    37→  confirmation_code?: string;
+    38→}
+    39→
+    40→interface LogEntry {
+    41→  id: string;
+    42→  timestamp: Date;
+    43→  request: {
+    44→    url: string;
+    45→    method: string;
+    46→    headers: Record<string, string>;
+    47→    body: Record<string, unknown>;
+    48→  };
+    49→  response: {
+    50→    status: number;
+    51→    body: Record<string, unknown>;
+    52→  } | null;
+    53→  error?: string;
+    54→}
+    55→
+    56→// ─── Helpers ────────────────────────────────────────────────────────────────
+    57→
+    58→function generateSessionToken(): string {
+    59→  const chars =
+    60→    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    61→  const array = new Uint8Array(32);
+    62→  crypto.getRandomValues(array);
+    63→  return Array.from(array, (b) => chars[b % chars.length]).join("");
+    64→}
+    65→
+    66→function formatTime(date: Date): string {
+    67→  return date.toLocaleTimeString("en-US", {
+    68→    hour: "2-digit",
+    69→    minute: "2-digit",
+    70→    second: "2-digit",
+    71→    hour12: false,
+    72→  });
+    73→}
+    74→
+    75→function syntaxHighlight(json: unknown): string {
+    76→  if (json === null || json === undefined) return '<span class="text-muted-foreground">null</span>';
+    77→  const str = JSON.stringify(json, null, 2);
+    78→  return str.replace(
+    79→    /("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)/g,
+    80→    (match) => {
+    81→      let cls = "text-orange-300"; // number
+    82→      if (/^"/.test(match)) {
+    83→        if (/:$/.test(match)) {
+    84→          cls = "text-sky-300"; // key
+    85→        } else {
+    86→          cls = "text-emerald-300"; // string
+    87→        }
+    88→      } else if (/true|false/.test(match)) {
+    89→        cls = "text-purple-400"; // boolean
+    90→      } else if (/null/.test(match)) {
+    91→        cls = "text-muted-foreground"; // null
+    92→      }
+    93→      return `<span class="${cls}">${match}</span>`;
+    94→    }
+    95→  );
+    96→}
+    97→
+    98→// ─── Celebration Overlay ────────────────────────────────────────────────────
+    99→
+   100→function CelebrationOverlay({
+   101→  code,
+   102→  onClose,
+   103→}: {
+   104→  code: string;
+   105→  onClose: () => void;
+   106→}) {
+   107→  return (
+   108→    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+   109→      <div className="relative mx-4 max-w-md w-full rounded-2xl border border-emerald-500/30 bg-gradient-to-br from-emerald-950/90 to-gray-950/95 p-8 text-center shadow-2xl shadow-emerald-500/20">
+   110→        {/* Confetti emoji burst */}
+   111→        <div className="mb-4 text-5xl">
+   112→          <Sparkles className="mx-auto h-12 w-12 text-emerald-400" />
+   113→        </div>
+   114→        <h2 className="mb-2 text-2xl font-bold text-emerald-300">
+   115→          Booking Confirmed!
+   116→        </h2>
+   117→        <p className="mb-6 text-sm text-gray-400">
+   118→          Your AI agent successfully completed a reservation.
+   119→        </p>
+   120→        <div className="mb-6 rounded-lg border border-emerald-500/30 bg-emerald-950/50 p-4">
+   121→          <p className="mb-1 text-xs font-medium uppercase tracking-wider text-emerald-400/70">
+   122→            Confirmation Code
+   123→          </p>
+   124→          <p className="font-mono text-3xl font-bold tracking-widest text-emerald-300">
+   125→            {code}
+   126→          </p>
+   127→        </div>
+   128→        <Button
+   129→          onClick={onClose}
+   130→          className="bg-emerald-600 hover:bg-emerald-500 text-white"
+   131→        >
+   132→          Dismiss
+   133→        </Button>
+   134→      </div>
+   135→    </div>
+   136→  );
+   137→}
+   138→
+   139→// ─── JSON Collapsible ───────────────────────────────────────────────────────
+   140→
+   141→function JsonBlock({
+   142→  label,
+   143→  data,
+   144→  defaultOpen = true,
+   145→}: {
+   146→  label: string;
+   147→  data: unknown;
+   148→  defaultOpen?: boolean;
+   149→}) {
+   150→  const [open, setOpen] = useState(defaultOpen);
+   151→  const [copied, setCopied] = useState(false);
+   152→
+   153→  const handleCopy = () => {
+   154→    navigator.clipboard.writeText(JSON.stringify(data, null, 2));
+   155→    setCopied(true);
+   156→    setTimeout(() => setCopied(false), 1500);
+   157→  };
+   158→
+   159→  return (
+   160→    <div className="rounded-lg border border-border/50 bg-muted/30">
+   161→      <button
+   162→        onClick={() => setOpen(!open)}
+   163→        className="flex w-full items-center justify-between px-3 py-2 text-left hover:bg-muted/50 transition-colors"
+   164→      >
+   165→        <span className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
+   166→          {open ? (
+   167→            <ChevronDown className="h-3.5 w-3.5" />
+   168→          ) : (
+   169→            <ChevronRight className="h-3.5 w-3.5" />
+   170→          )}
+   171→          {label}
+   172→        </span>
+   173→        <button
+   174→          onClick={(e) => {
+   175→            e.stopPropagation();
+   176→            handleCopy();
+   177→          }}
+   178→          className="rounded p-1 text-muted-foreground hover:text-foreground transition-colors"
+   179→          title="Copy to clipboard"
+   180→        >
+   181→          {copied ? (
+   182→            <Check className="h-3.5 w-3.5 text-emerald-400" />
+   183→          ) : (
+   184→            <Copy className="h-3.5 w-3.5" />
+   185→          )}
+   186→        </button>
+   187→      </button>
+   188→      {open && (
+   189→        <div className="border-t border-border/30 px-3 py-2">
+   190→          <pre
+   191→            className="overflow-x-auto text-xs leading-relaxed font-mono"
+   192→            dangerouslySetInnerHTML={{ __html: syntaxHighlight(data) }}
+   193→          />
+   194→        </div>
+   195→      )}
+   196→    </div>
+   197→  );
+   198→}
+   199→
+   200→// ─── Main Page ──────────────────────────────────────────────────────────────
+   201→
+   202→export default function DashboardPage() {
+   203→  // Config state
+   204→  const [apiKey, setApiKey] = useState("");
+   205→  const [sessionToken, setSessionToken] = useState("");
+   206→  const [backendUrl, setBackendUrl] = useState("http://127.0.0.1:8000");
+   207→  const [healthStatus, setHealthStatus] = useState<
+   208→    "online" | "offline" | "checking"
+   209→  >("checking");
+   210→
+   211→  // Chat state
+   212→  const [messages, setMessages] = useState<ChatMessage[]>([]);
+   213→  const [input, setInput] = useState("");
+   214→  const [isLoading, setIsLoading] = useState(false);
+   215→  const [celebration, setCelebration] = useState<string | null>(null);
+   216→
+   217→  // Inspector state
+   218→  const [logs, setLogs] = useState<LogEntry[]>([]);
+   219→
+   220→  // Refs
+   221→  const chatEndRef = useRef<HTMLDivElement>(null);
+   222→  const inputRef = useRef<HTMLInputElement>(null);
+   223→
+   224→  // Generate session token on mount
+   225→  useEffect(() => {
+   226→    setSessionToken(generateSessionToken());
+   227→  }, []);
+   228→
+   229→  // Auto-scroll chat
+   230→  useEffect(() => {
+   231→    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+   232→  }, [messages]);
+   233→
+   234→  // ─── Health Check ───────────────────────────────────────────────────────
+   235→
+   236→  const checkHealth = useCallback(async () => {
+   237→    setHealthStatus("checking");
+   238→    try {
+   239→      const res = await fetch(`${backendUrl}/health`, {
+   240→        signal: AbortSignal.timeout(5000),
+   241→      });
+   242→      if (res.ok) {
+   243→        setHealthStatus("online");
+   244→      } else {
+   245→        setHealthStatus("offline");
+   246→      }
+   247→    } catch {
+   248→      setHealthStatus("offline");
+   249→    }
+   250→  }, [backendUrl]);
+   251→
+   252→  useEffect(() => {
+   253→    checkHealth();
+   254→    const interval = setInterval(checkHealth, 15000);
+   255→    return () => clearInterval(interval);
+   256→  }, [checkHealth]);
+   257→
+   258→  // ─── Send Message ──────────────────────────────────────────────────────
+   259→
+   260→  const sendMessage = async () => {
+   261→    const text = input.trim();
+   262→    if (!text || isLoading) return;
+   263→
+   264→    if (!apiKey.trim()) {
+   265→      toast.error("Missing API Key", {
+   266→        description: "Enter your restaurant X-Api-Key in the config bar above.",
+   267→      });
+   268→      return;
+   269→    }
+   270→
+   271→    // Add user message
+   272→    const userMsg: ChatMessage = {
+   273→      id: crypto.randomUUID(),
+   274→      role: "user",
+   275→      content: text,
+   276→      timestamp: new Date(),
+   277→    };
+   278→    setMessages((prev) => [...prev, userMsg]);
+   279→    setInput("");
+   280→    setIsLoading(true);
+   281→
+   282→    // Build request payload
+   283→    const requestHeaders: Record<string, string> = {
+   284→      "Content-Type": "application/json",
+   285→      "X-Api-Key": apiKey.trim(),
+   286→      "X-Session-Token": sessionToken,
+   287→    };
+   288→
+   289→    const requestBody = { message: text };
+   290→
+   291→    const logEntry: LogEntry = {
+   292→      id: crypto.randomUUID(),
+   293→      timestamp: new Date(),
+   294→      request: {
+   295→        url: `${backendUrl}/api/widget/chat`,
+   296→        method: "POST",
+   297→        headers: requestHeaders,
+   298→        body: requestBody,
+   299→      },
+   300→      response: null,
+   301→    };
+   302→
+   303→    try {
+   304→      const res = await fetch(`${backendUrl}/api/widget/chat`, {
+   305→        method: "POST",
+   306→        headers: requestHeaders,
+   307→        body: JSON.stringify(requestBody),
+   308→        signal: AbortSignal.timeout(30000),
+   309→      });
+   310→
+   311→      const data = await res.json();
+   312→
+   313→      logEntry.response = {
+   314→        status: res.status,
+   315→        body: data,
+   316→      };
+   317→
+   318→      if (!res.ok) {
+   319→        const errMsg =
+   320→          data?.detail?.message ||
+   321→          data?.detail ||
+   322→          `HTTP ${res.status}: ${res.statusText}`;
+   323→        const assistantMsg: ChatMessage = {
+   324→          id: crypto.randomUUID(),
+   325→          role: "assistant",
+   326→          content: `⚠️ Error: ${errMsg}`,
+   327→          timestamp: new Date(),
+   328→        };
+   329→        setMessages((prev) => [...prev, assistantMsg]);
+   330→      } else {
+   331→        // Update session token if server returns a new one
+   332→        if (data.session_token) {
+   333→          setSessionToken(data.session_token);
+   334→        }
+   335→
+   336→        const assistantMsg: ChatMessage = {
+   337→          id: crypto.randomUUID(),
+   338→          role: "assistant",
+   339→          content: data.reply || "(empty reply)",
+   340→          timestamp: new Date(),
+   341→          booking_complete: data.booking_complete,
+   342→          confirmation_code: data.confirmation_code,
+   343→        };
+   344→        setMessages((prev) => [...prev, assistantMsg]);
+   345→
+   346→        // Trigger celebration on booking complete
+   347→        if (data.booking_complete && data.confirmation_code) {
+   348→          setCelebration(data.confirmation_code);
+   349→        }
+   350→      }
+   351→    } catch (err) {
+   352→      const errorMsg =
+   353→        err instanceof Error ? err.message : "Unknown network error";
+   354→      logEntry.error = errorMsg;
+   355→      logEntry.response = null;
+   356→
+   357→      const assistantMsg: ChatMessage = {
+   358→        id: crypto.randomUUID(),
+   359→        role: "assistant",
+   360→        content: `🔴 Network Error: ${errorMsg}. Is your backend running at ${backendUrl}?`,
+   361→        timestamp: new Date(),
+   362→      };
+   363→      setMessages((prev) => [...prev, assistantMsg]);
+   364→    } finally {
+   365→      setLogs((prev) => [...prev, logEntry]);
+   366→      setIsLoading(false);
+   367→      inputRef.current?.focus();
+   368→    }
+   369→  };
+   370→
+   371→  // ─── Key handler ───────────────────────────────────────────────────────
+   372→
+   373→  const handleKeyDown = (e: React.KeyboardEvent) => {
+   374→    if (e.key === "Enter" && !e.shiftKey) {
+   375→      e.preventDefault();
+   376→      sendMessage();
+   377→    }
+   378→  };
+   379→
+   380→  // ─── Copy session token ────────────────────────────────────────────────
+   381→
+   382→  const [copiedToken, setCopiedToken] = useState(false);
+   383→  const copyToken = () => {
+   384→    navigator.clipboard.writeText(sessionToken);
+   385→    setCopiedToken(true);
+   386→    setTimeout(() => setCopiedToken(false), 1500);
+   387→  };
+   388→
+   389→  // ─── Reset session ─────────────────────────────────────────────────────
+   390→
+   391→  const resetSession = () => {
+   392→    setSessionToken(generateSessionToken());
+   393→    setMessages([]);
+   394→    setLogs([]);
+   395→    toast.success("Session reset", {
+   396→      description: "New session token generated. Chat cleared.",
+   397→    });
+   398→  };
+   399→
+   400→  // ─── Render ────────────────────────────────────────────────────────────
+   401→
+   402→  return (
+   403→    <div className="flex min-h-screen flex-col bg-background">
+   404→      {/* Celebration overlay */}
+   405→      {celebration && (
+   406→        <CelebrationOverlay
+   407→          code={celebration}
+   408→          onClose={() => setCelebration(null)}
+   409→        />
+   410→      )}
+   411→
+   412→      {/* ─── Top Config Bar ─────────────────────────────────────────────── */}
+   413→      <header className="sticky top-0 z-40 border-b border-border/50 bg-card/80 backdrop-blur-xl">
+   414→        <div className="mx-auto max-w-screen-2xl px-4 py-3">
+   415→          {/* Brand row */}
+   416→          <div className="mb-3 flex items-center justify-between">
+   417→            <div className="flex items-center gap-3">
+   418→              <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-600/20">
+   419→                <Zap className="h-4 w-4 text-emerald-400" />
+   420→              </div>
+   421→              <div>
+   422→                <h1 className="text-sm font-bold tracking-tight">
+   423→                  LiftUp AI{" "}
+   424→                  <span className="text-emerald-400">Testing Dashboard</span>
+   425→                </h1>
+   426→                <p className="text-[11px] text-muted-foreground">
+   427→                  Debug your Aria reservation agent in real-time
+   428→                </p>
+   429→              </div>
+   430→            </div>
+   431→            <div className="flex items-center gap-2">
+   432→              <Button
+   433→                variant="ghost"
+   434→                size="sm"
+   435→                onClick={resetSession}
+   436→                className="h-7 text-xs text-muted-foreground hover:text-foreground"
+   437→              >
+   438→                <Trash2 className="mr-1 h-3 w-3" />
+   439→                Reset
+   440→              </Button>
+   441→            </div>
+   442→          </div>
+   443→
+   444→          {/* Config inputs row */}
+   445→          <div className="flex flex-wrap items-center gap-2">
+   446→            {/* Backend URL */}
+   447→            <div className="flex items-center gap-1.5">
+   448→              <Server className="h-3.5 w-3.5 text-muted-foreground" />
+   449→              <Input
+   450→                value={backendUrl}
+   451→                onChange={(e) => setBackendUrl(e.target.value)}
+   452→                placeholder="http://127.0.0.1:8000"
+   453→                className="h-8 w-52 text-xs font-mono bg-muted/50 border-border/50"
+   454→              />
+   455→            </div>
+   456→
+   457→            <Separator orientation="vertical" className="h-6 mx-1" />
+   458→
+   459→            {/* API Key */}
+   460→            <div className="flex items-center gap-1.5">
+   461→              <KeyRound className="h-3.5 w-3.5 text-muted-foreground" />
+   462→              <Input
+   463→                value={apiKey}
+   464→                onChange={(e) => setApiKey(e.target.value)}
+   465→                placeholder="X-Api-Key"
+   466→                type="password"
+   467→                className="h-8 w-56 text-xs font-mono bg-muted/50 border-border/50"
+   468→              />
+   469→            </div>
+   470→
+   471→            <Separator orientation="vertical" className="h-6 mx-1" />
+   472→
+   473→            {/* Session Token */}
+   474→            <div className="flex items-center gap-1.5">
+   475→              <Fingerprint className="h-3.5 w-3.5 text-muted-foreground" />
+   476→              <Input
+   477→                value={sessionToken}
+   478→                onChange={(e) => setSessionToken(e.target.value)}
+   479→                placeholder="X-Session-Token"
+   480→                className="h-8 w-64 text-xs font-mono bg-muted/50 border-border/50"
+   481→              />
+   482→              <Button
+   483→                variant="ghost"
+   484→                size="sm"
+   485→                onClick={copyToken}
+   486→                className="h-7 w-7 p-0 text-muted-foreground hover:text-foreground"
+   487→                title="Copy session token"
+   488→              >
+   489→                {copiedToken ? (
+   490→                  <Check className="h-3.5 w-3.5 text-emerald-400" />
+   491→                ) : (
+   492→                  <Copy className="h-3.5 w-3.5" />
+   493→                )}
+   494→              </Button>
+   495→            </div>
+   496→
+   497→            <Separator orientation="vertical" className="h-6 mx-1" />
+   498→
+   499→            {/* Health indicator */}
+   500→            <button
+   501→              onClick={checkHealth}
+   502→              className="flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition-colors hover:bg-muted/50"
+   503→              title="Click to re-check health"
+   504→            >
+   505→              {healthStatus === "checking" ? (
+   506→                <>
+   507→                  <RefreshCw className="h-3.5 w-3.5 animate-spin text-yellow-400" />
+   508→                  <span className="text-yellow-400">Checking...</span>
+   509→                </>
+   510→              ) : healthStatus === "online" ? (
+   511→                <>
+   512→                  <Wifi className="h-3.5 w-3.5 text-emerald-400" />
+   513→                  <span className="text-emerald-400">Online</span>
+   514→                </>
+   515→              ) : (
+   516→                <>
+   517→                  <WifiOff className="h-3.5 w-3.5 text-red-400" />
+   518→                  <span className="text-red-400">Offline</span>
+   519→                </>
+   520→              )}
+   521→            </button>
+   522→          </div>
+   523→        </div>
+   524→      </header>
+   525→
+   526→      {/* ─── Main Content: Chat + Inspector ──────────────────────────────── */}
+   527→      <main className="flex flex-1 overflow-hidden">
+   528→        {/* ─── Left Panel: Chat ──────────────────────────────────────────── */}
+   529→        <div className="flex w-full flex-col border-r border-border/50 lg:w-3/5">
+   530→          {/* Chat header */}
+   531→          <div className="flex items-center justify-between border-b border-border/30 px-4 py-2.5">
+   532→            <div className="flex items-center gap-2">
+   533→              <Bot className="h-4 w-4 text-emerald-400" />
+   534→              <span className="text-sm font-medium">AI Chat Tester</span>
+   535→              <Badge variant="secondary" className="h-5 text-[10px] px-1.5">
+   536→                Aria
+   537→              </Badge>
+   538→            </div>
+   539→            <span className="text-[11px] text-muted-foreground">
+   540→              {messages.length} message{messages.length !== 1 ? "s" : ""}
+   541→            </span>
+   542→          </div>
+   543→
+   544→          {/* Messages area */}
+   545→          <ScrollArea className="flex-1 px-4 py-4">
+   546→            {messages.length === 0 ? (
+   547→              <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
+   548→                <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-emerald-600/10">
+   549→                  <Bot className="h-8 w-8 text-emerald-400/50" />
+   550→                </div>
+   551→                <div>
+   552→                  <p className="text-sm font-medium text-muted-foreground">
+   553→                    No messages yet
+   554→                  </p>
+   555→                  <p className="mt-1 text-xs text-muted-foreground/60 max-w-xs">
+   556→                    Type a message below to start testing your Aria AI agent.
+   557→                    Try &quot;I&apos;d like a table for 4 tonight at 7pm&quot;.
+   558→                  </p>
+   559→                </div>
+   560→              </div>
+   561→            ) : (
+   562→              <div className="space-y-4">
+   563→                {messages.map((msg) => (
+   564→                  <div
+   565→                    key={msg.id}
+   566→                    className={`flex gap-3 ${
+   567→                      msg.role === "user" ? "justify-end" : "justify-start"
+   568→                    }`}
+   569→                  >
+   570→                    {msg.role === "assistant" && (
+   571→                      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-emerald-600/20 mt-0.5">
+   572→                        <Bot className="h-3.5 w-3.5 text-emerald-400" />
+   573→                      </div>
+   574→                    )}
+   575→                    <div
+   576→                      className={`max-w-[75%] rounded-2xl px-4 py-2.5 ${
+   577→                        msg.role === "user"
+   578→                          ? "bg-emerald-600 text-white"
+   579→                          : "bg-muted/80 text-foreground"
+   580→                      }`}
+   581→                    >
+   582→                      <p className="text-sm leading-relaxed whitespace-pre-wrap">
+   583→                        {msg.content}
+   584→                      </p>
+   585→                      {msg.booking_complete && msg.confirmation_code && (
+   586→                        <div className="mt-2 rounded-lg border border-emerald-500/30 bg-emerald-950/50 p-2.5">
+   587→                          <p className="text-[10px] uppercase tracking-wider text-emerald-400/70">
+   588→                            Confirmed
+   589→                          </p>
+   590→                          <p className="font-mono text-lg font-bold text-emerald-300">
+   591→                            {msg.confirmation_code}
+   592→                          </p>
+   593→                        </div>
+   594→                      )}
+   595→                      <p
+   596→                        className={`mt-1 text-[10px] ${
+   597→                          msg.role === "user"
+   598→                            ? "text-emerald-200/50"
+   599→                            : "text-muted-foreground/50"
+   600→                        }`}
+   601→                      >
+   602→                        {formatTime(msg.timestamp)}
+   603→                      </p>
+   604→                    </div>
+   605→                    {msg.role === "user" && (
+   606→                      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-sky-600/20 mt-0.5">
+   607→                        <User className="h-3.5 w-3.5 text-sky-400" />
+   608→                      </div>
+   609→                    )}
+   610→                  </div>
+   611→                ))}
+   612→
+   613→                {/* Loading indicator */}
+   614→                {isLoading && (
+   615→                  <div className="flex gap-3 justify-start">
+   616→                    <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-emerald-600/20 mt-0.5">
+   617→                      <Bot className="h-3.5 w-3.5 text-emerald-400" />
+   618→                    </div>
+   619→                    <div className="rounded-2xl bg-muted/80 px-4 py-3">
+   620→                      <div className="flex items-center gap-1.5">
+   621→                        <div className="h-2 w-2 rounded-full bg-emerald-400/60 animate-bounce [animation-delay:0ms]" />
+   622→                        <div className="h-2 w-2 rounded-full bg-emerald-400/60 animate-bounce [animation-delay:150ms]" />
+   623→                        <div className="h-2 w-2 rounded-full bg-emerald-400/60 animate-bounce [animation-delay:300ms]" />
+   624→                      </div>
+   625→                    </div>
+   626→                  </div>
+   627→                )}
+   628→                <div ref={chatEndRef} />
+   629→              </div>
+   630→            )}
+   631→          </ScrollArea>
+   632→
+   633→          {/* Input area */}
+   634→          <div className="border-t border-border/30 p-3">
+   635→            <div className="flex gap-2">
+   636→              <Input
+   637→                ref={inputRef}
+   638→                value={input}
+   639→                onChange={(e) => setInput(e.target.value)}
+   640→                onKeyDown={handleKeyDown}
+   641→                placeholder="Type a message to test Aria..."
+   642→                disabled={isLoading}
+   643→                className="h-10 text-sm bg-muted/50 border-border/50 focus-visible:ring-emerald-500/30"
+   644→              />
+   645→              <Button
+   646→                onClick={sendMessage}
+   647→                disabled={isLoading || !input.trim()}
+   648→                className="h-10 px-4 bg-emerald-600 hover:bg-emerald-500 text-white"
+   649→              >
+   650→                <Send className="h-4 w-4" />
+   651→              </Button>
+   652→            </div>
+   653→          </div>
+   654→        </div>
+   655→
+   656→        {/* ─── Right Panel: State Inspector ──────────────────────────────── */}
+   657→        <div className="hidden w-full flex-col lg:flex lg:w-2/5">
+   658→          {/* Inspector header */}
+   659→          <div className="flex items-center justify-between border-b border-border/30 px-4 py-2.5">
+   660→            <div className="flex items-center gap-2">
+   661→              <svg
+   662→                className="h-4 w-4 text-sky-400"
+   663→                viewBox="0 0 24 24"
+   664→                fill="none"
+   665→                stroke="currentColor"
+   666→                strokeWidth="2"
+   667→                strokeLinecap="round"
+   668→                strokeLinejoin="round"
+   669→              >
+   670→                <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z" />
+   671→              </svg>
+   672→              <span className="text-sm font-medium">State Inspector</span>
+   673→              <Badge variant="outline" className="h-5 text-[10px] px-1.5">
+   674→                {logs.length} request{logs.length !== 1 ? "s" : ""}
+   675→              </Badge>
+   676→            </div>
+   677→            {logs.length > 0 && (
+   678→              <Button
+   679→                variant="ghost"
+   680→                size="sm"
+   681→                onClick={() => setLogs([])}
+   682→                className="h-6 text-[11px] text-muted-foreground hover:text-foreground"
+   683→              >
+   684→                <Trash2 className="mr-1 h-3 w-3" />
+   685→                Clear
+   686→              </Button>
+   687→            )}
+   688→          </div>
+   689→
+   690→          {/* Logs area */}
+   691→          <ScrollArea className="flex-1 px-4 py-3">
+   692→            {logs.length === 0 ? (
+   693→              <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
+   694→                <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-sky-600/10">
+   695→                  <svg
+   696→                    className="h-8 w-8 text-sky-400/50"
+   697→                    viewBox="0 0 24 24"
+   698→                    fill="none"
+   699→                    stroke="currentColor"
+   700→                    strokeWidth="2"
+   701→                    strokeLinecap="round"
+   702→                    strokeLinejoin="round"
+   703→                  >
+   704→                    <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z" />
+   705→                  </svg>
+   706→                </div>
+   707→                <div>
+   708→                  <p className="text-sm font-medium text-muted-foreground">
+   709→                    No requests yet
+   710→                  </p>
+   711→                  <p className="mt-1 text-xs text-muted-foreground/60 max-w-xs">
+   712→                    Send a message in the chat to see the raw request and
+   713→                    response payloads here.
+   714→                  </p>
+   715→                </div>
+   716→              </div>
+   717→            ) : (
+   718→              <div className="space-y-4">
+   719→                {[...logs].reverse().map((log) => (
+   720→                  <div
+   721→                    key={log.id}
+   722→                    className="rounded-xl border border-border/50 bg-card/50 p-3 space-y-2.5"
+   723→                  >
+   724→                    {/* Log header */}
+   725→                    <div className="flex items-center justify-between">
+   726→                      <div className="flex items-center gap-2">
+   727→                        <Badge
+   728→                          variant={
+   729→                            log.response?.status &&
+   730→                            log.response.status < 400
+   731→                              ? "default"
+   732→                              : "destructive"
+   733→                          }
+   734→                          className="h-5 text-[10px] px-1.5 font-mono"
+   735→                        >
+   736→                          {log.error
+   737→                            ? "ERR"
+   738→                            : log.response
+   739→                              ? `${log.response.status}`
+   740→                              : "PENDING"}
+   741→                        </Badge>
+   742→                        <span className="text-[11px] font-medium">
+   743→                          POST /api/widget/chat
+   744→                        </span>
+   745→                      </div>
+   746→                      <span className="text-[10px] text-muted-foreground font-mono">
+   747→                        {formatTime(log.timestamp)}
+   748→                      </span>
+   749→                    </div>
+   750→
+   751→                    {/* Request */}
+   752→                    <JsonBlock
+   753→                      label="Request"
+   754→                      data={{
+   755→                        url: log.request.url,
+   756→                        method: log.request.method,
+   757→                        headers: log.request.headers,
+   758→                        body: log.request.body,
+   759→                      }}
+   760→                      defaultOpen={false}
+   761→                    />
+   762→
+   763→                    {/* Response */}
+   764→                    {log.response && (
+   765→                      <JsonBlock
+   766→                        label="Response"
+   767→                        data={log.response.body}
+   768→                        defaultOpen={true}
+   769→                      />
+   770→                    )}
+   771→
+   772→                    {/* Error */}
+   773→                    {log.error && (
+   774→                      <div className="rounded-lg border border-red-500/30 bg-red-950/30 p-3">
+   775→                        <p className="text-xs font-medium text-red-400">
+   776→                          Error
+   777→                        </p>
+   778→                        <p className="mt-1 text-xs text-red-300/80 font-mono">
+   779→                          {log.error}
+   780→                        </p>
+   781→                      </div>
+   782→                    )}
+   783→                  </div>
+   784→                ))}
+   785→              </div>
+   786→            )}
+   787→          </ScrollArea>
+   788→
+   789→          {/* Current config summary */}
+   790→          <div className="border-t border-border/30 px-4 py-2.5">
+   791→            <p className="text-[10px] uppercase tracking-wider text-muted-foreground/50 mb-1.5">
+   792→              Active Config
+   793→            </p>
+   794→            <div className="flex flex-wrap gap-1.5">
+   795→              <Badge
+   796→                variant="outline"
+   797→                className="h-5 text-[10px] font-mono gap-1"
+   798→              >
+   799→                <KeyRound className="h-2.5 w-2.5" />
+   800→                {apiKey
+   801→                  ? `${apiKey.slice(0, 6)}...${apiKey.slice(-4)}`
+   802→                  : "Not set"}
+   803→              </Badge>
+   804→              <Badge
+   805→                variant="outline"
+   806→                className="h-5 text-[10px] font-mono gap-1"
+   807→              >
+   808→                <Fingerprint className="h-2.5 w-2.5" />
+   809→                {sessionToken
+   810→                  ? `${sessionToken.slice(0, 6)}...${sessionToken.slice(-4)}`
+   811→                  : "Not set"}
+   812→              </Badge>
+   813→              <Badge
+   814→                variant="outline"
+   815→                className="h-5 text-[10px] font-mono gap-1"
+   816→              >
+   817→                <Server className="h-2.5 w-2.5" />
+   818→                {backendUrl.replace(/^https?:\/\//, "")}
+   819→              </Badge>
+   820→            </div>
+   821→          </div>
+   822→        </div>
+   823→      </main>
+   824→
+   825→      {/* Mobile: Inspector below chat */}
+   826→      <div className="lg:hidden border-t border-border/50">
+   827→        <details className="group">
+   828→          <summary className="flex cursor-pointer items-center justify-between px-4 py-2.5 text-sm font-medium hover:bg-muted/30">
+   829→            <div className="flex items-center gap-2">
+   830→              <svg
+   831→                className="h-4 w-4 text-sky-400"
+   832→                viewBox="0 0 24 24"
+   833→                fill="none"
+   834→                stroke="currentColor"
+   835→                strokeWidth="2"
+   836→                strokeLinecap="round"
+   837→                strokeLinejoin="round"
+   838→              >
+   839→                <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z" />
+   840→              </svg>
+   841→              State Inspector
+   842→              <Badge variant="outline" className="h-5 text-[10px] px-1.5">
+   843→                {logs.length}
+   844→              </Badge>
+   845→            </div>
+   846→            <ChevronDown className="h-4 w-4 text-muted-foreground group-open:rotate-180 transition-transform" />
+   847→          </summary>
+   848→          <div className="max-h-96 overflow-y-auto px-4 py-3 space-y-3">
+   849→            {logs.length === 0 ? (
+   850→              <p className="text-xs text-muted-foreground text-center py-6">
+   851→                No requests yet. Send a message to see payloads.
+   852→              </p>
+   853→            ) : (
+   854→              [...logs].reverse().map((log) => (
+   855→                <div
+   856→                  key={log.id}
+   857→                  className="rounded-lg border border-border/50 bg-card/50 p-3 space-y-2"
+   858→                >
+   859→                  <div className="flex items-center gap-2">
+   860→                    <Badge
+   861→                      variant={
+   862→                        log.response?.status && log.response.status < 400
+   863→                          ? "default"
+   864→                          : "destructive"
+   865→                      }
+   866→                      className="h-5 text-[10px] px-1.5 font-mono"
+   867→                    >
+   868→                      {log.error
+   869→                        ? "ERR"
+   870→                        : log.response
+   871→                          ? `${log.response.status}`
+   872→                          : "PENDING"}
+   873→                    </Badge>
+   874→                    <span className="text-[11px] font-mono text-muted-foreground">
+   875→                      {formatTime(log.timestamp)}
+   876→                    </span>
+   877→                  </div>
+   878→                  <JsonBlock label="Request" data={log.request} defaultOpen={false} />
+   879→                  {log.response && (
+   880→                    <JsonBlock label="Response" data={log.response.body} defaultOpen={true} />
+   881→                  )}
+   882→                  {log.error && (
+   883→                    <div className="rounded border border-red-500/30 bg-red-950/30 p-2">
+   884→                      <p className="text-xs text-red-300 font-mono">{log.error}</p>
+   885→                    </div>
+   886→                  )}
+   887→                </div>
+   888→              ))
+   889→            )}
+   890→          </div>
+   891→        </details>
+   892→      </div>
+   893→    </div>
+   894→  );
+   895→}
+   896→

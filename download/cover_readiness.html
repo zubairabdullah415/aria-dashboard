@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LiftUp SaaS - Production Readiness Assessment</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=Playfair+Display:wght@700&display=swap" rel="stylesheet">
+  <style>
+    @media screen {
+      html { height: auto; display: flex; justify-content: center; }
+      body { transform-origin: top center; scale: min(1, calc(100vh / 1123)); margin: 0 auto; }
+    }
+  </style>
+  <style>
+    @page { size: 794px 1123px; margin: 0; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 794px; height: 1123px; background: #ffffff; }
+    .cover {
+      width: 794px; height: 1123px;
+      position: relative; padding: 0;
+      background: #ffffff;
+      font-family: 'Inter', sans-serif;
+    }
+    /* Geometric accent - left bar */
+    .accent-bar {
+      position: absolute; left: 0; top: 0; bottom: 0;
+      width: 8px; background: #24738e;
+    }
+    /* Geometric accent - top-right corner */
+    .corner-accent {
+      position: absolute; top: 60px; right: 60px;
+      width: 120px; height: 120px;
+      border: 3px solid rgba(36, 115, 142, 0.15);
+      border-radius: 50%;
+    }
+    /* Content blocks */
+    .top-zone {
+      position: absolute; top: 140px; left: 80px; right: 80px;
+    }
+    .kicker {
+      font-size: 14px; font-weight: 600; letter-spacing: 3px;
+      color: #24738e; text-transform: uppercase; margin-bottom: 20px;
+    }
+    .hero-title {
+      font-family: 'Playfair Display', serif;
+      font-size: 44px; font-weight: 700; line-height: 1.2;
+      color: #191b1c; margin-bottom: 16px;
+    }
+    .subtitle {
+      font-size: 20px; font-weight: 300; line-height: 1.5;
+      color: #7b8187; margin-bottom: 0;
+    }
+    /* Middle separator line */
+    .separator {
+      position: absolute; top: 440px; left: 80px;
+      width: 200px; height: 2px;
+      background: #24738e;
+    }
+    /* Summary block */
+    .summary-zone {
+      position: absolute; top: 480px; left: 80px; right: 80px;
+    }
+    .summary-label {
+      font-size: 11px; font-weight: 600; letter-spacing: 2px;
+      color: #24738e; text-transform: uppercase; margin-bottom: 12px;
+    }
+    .summary-text {
+      font-size: 15px; line-height: 1.7; color: #191b1c;
+      max-width: 520px;
+    }
+    /* Score badge */
+    .score-zone {
+      position: absolute; bottom: 140px; left: 80px;
+    }
+    .score-label {
+      font-size: 11px; font-weight: 600; letter-spacing: 2px;
+      color: #7b8187; text-transform: uppercase; margin-bottom: 8px;
+    }
+    .score-value {
+      font-family: 'Playfair Display', serif;
+      font-size: 64px; font-weight: 700;
+      color: #24738e; line-height: 1;
+    }
+    .score-max {
+      font-size: 22px; font-weight: 300; color: #7b8187;
+      margin-left: 4px;
+    }
+    .score-status {
+      font-size: 14px; font-weight: 600; color: #c62828;
+      margin-top: 6px; letter-spacing: 1px;
+    }
+    /* Bottom metadata */
+    .meta-zone {
+      position: absolute; bottom: 60px; left: 80px; right: 80px;
+      display: flex; justify-content: space-between;
+    }
+    .meta-item {
+      font-size: 12px; color: #7b8187; line-height: 1.5;
+    }
+    .meta-item strong {
+      color: #191b1c; font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+<div class="cover">
+  <div class="accent-bar"></div>
+  <div class="corner-accent"></div>
+
+  <div class="top-zone">
+    <div class="kicker">Technical Assessment</div>
+    <div class="hero-title">LiftUp SaaS<br>Production Readiness<br>Assessment</div>
+    <div class="subtitle">Multi-Tenant AI Reservation Platform<br>Pre-Launch Code & Architecture Review</div>
+  </div>
+
+  <div class="separator"></div>
+
+  <div class="summary-zone">
+    <div class="summary-label">Summary</div>
+    <div class="summary-text">
+      The core booking pipeline is functional, but critical logic bugs in the modify flow,
+      insufficient observability, and production infrastructure gaps prevent a safe 50-restaurant
+      launch. This report details 3 blocking issues, 4 critical improvements, and a prioritized
+      remediation plan with estimated effort.
+    </div>
+  </div>
+
+  <div class="score-zone">
+    <div class="score-label">Overall Readiness</div>
+    <div class="score-value">5.5<span class="score-max">/10</span></div>
+    <div class="score-status">NOT PRODUCTION READY</div>
+  </div>
+
+  <div class="meta-zone">
+    <div class="meta-item"><strong>Date:</strong> 2026-06-04</div>
+    <div class="meta-item"><strong>Version:</strong> 1.0</div>
+    <div class="meta-item"><strong>Author:</strong> Z.ai Engineering</div>
+  </div>
+</div>
+</body>
+</html>

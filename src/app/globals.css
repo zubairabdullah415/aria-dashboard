@@ -1,0 +1,210 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-inter), var(--font-nastaliq), system-ui, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+/* ─── Premium Emerald Palette (Light, Customer-Facing) ────────────────────
+   Design language: crisp whites, soft warm grays, deep emerald primary.
+   Inspired by high-end hospitality apps (Resy, OpenTable premium tier).
+   Only light mode — this is a customer widget, not a developer tool.
+   ─────────────────────────────────────────────────────────────────────── */
+:root {
+  --radius: 0.875rem;
+
+  /* Surfaces */
+  --background: oklch(0.99 0.005 145);        /* warm near-white */
+  --foreground: oklch(0.22 0.02 160);         /* deep charcoal with green undertone */
+  --card: oklch(1 0 0);                       /* pure white cards */
+  --card-foreground: oklch(0.22 0.02 160);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.22 0.02 160);
+
+  /* Brand: Deep Emerald */
+  --primary: oklch(0.45 0.13 162);            /* ~ #047857 emerald-700 */
+  --primary-foreground: oklch(0.99 0.01 145); /* near-white on emerald */
+
+  /* Secondary: soft warm gray */
+  --secondary: oklch(0.96 0.005 145);
+  --secondary-foreground: oklch(0.30 0.02 160);
+
+  /* Muted */
+  --muted: oklch(0.97 0.005 145);
+  --muted-foreground: oklch(0.52 0.015 160);
+
+  /* Accent: lighter emerald tint */
+  --accent: oklch(0.94 0.04 162);
+  --accent-foreground: oklch(0.35 0.11 162);
+
+  --destructive: oklch(0.58 0.24 27);
+  --border: oklch(0.92 0.01 145);
+  --input: oklch(0.94 0.01 145);
+  --ring: oklch(0.45 0.13 162);
+
+  /* Chart colors (kept from defaults, not used heavily) */
+  --chart-1: oklch(0.45 0.13 162);
+  --chart-2: oklch(0.65 0.15 145);
+  --chart-3: oklch(0.55 0.10 200);
+  --chart-4: oklch(0.75 0.15 80);
+  --chart-5: oklch(0.60 0.18 30);
+
+  --sidebar: oklch(0.985 0.005 145);
+  --sidebar-foreground: oklch(0.22 0.02 160);
+  --sidebar-primary: oklch(0.45 0.13 162);
+  --sidebar-primary-foreground: oklch(0.99 0.01 145);
+  --sidebar-accent: oklch(0.94 0.04 162);
+  --sidebar-accent-foreground: oklch(0.35 0.11 162);
+  --sidebar-border: oklch(0.92 0.01 145);
+  --sidebar-ring: oklch(0.45 0.13 162);
+}
+
+/* Dark mode kept minimal — widget is customer-facing light by design,
+   but variables are defined so shadcn components don't break if .dark
+   is ever applied. */
+.dark {
+  --background: oklch(0.18 0.02 162);
+  --foreground: oklch(0.96 0.01 145);
+  --card: oklch(0.22 0.025 162);
+  --card-foreground: oklch(0.96 0.01 145);
+  --popover: oklch(0.22 0.025 162);
+  --popover-foreground: oklch(0.96 0.01 145);
+  --primary: oklch(0.60 0.14 162);
+  --primary-foreground: oklch(0.18 0.02 162);
+  --secondary: oklch(0.28 0.02 162);
+  --secondary-foreground: oklch(0.96 0.01 145);
+  --muted: oklch(0.28 0.02 162);
+  --muted-foreground: oklch(0.70 0.015 160);
+  --accent: oklch(0.32 0.04 162);
+  --accent-foreground: oklch(0.96 0.01 145);
+  --destructive: oklch(0.70 0.19 22);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 12%);
+  --ring: oklch(0.60 0.14 162);
+  --chart-1: oklch(0.60 0.14 162);
+  --chart-2: oklch(0.70 0.15 145);
+  --chart-3: oklch(0.65 0.10 200);
+  --chart-4: oklch(0.75 0.15 80);
+  --chart-5: oklch(0.65 0.18 30);
+  --sidebar: oklch(0.22 0.025 162);
+  --sidebar-foreground: oklch(0.96 0.01 145);
+  --sidebar-primary: oklch(0.60 0.14 162);
+  --sidebar-primary-foreground: oklch(0.18 0.02 162);
+  --sidebar-accent: oklch(0.32 0.04 162);
+  --sidebar-accent-foreground: oklch(0.96 0.01 145);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.60 0.14 162);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html, body {
+    @apply bg-background text-foreground;
+    /* Generous line-height for bilingual text (English + Nastaliq Urdu) */
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    /* Prevent iOS rubber-band scroll on the widget shell */
+    overscroll-behavior: none;
+  }
+  /* Urdu script auto-fallback: any Arabic-block character renders in Nastaliq */
+  [lang="ur"], .urdu {
+    font-family: var(--font-nastaliq), var(--font-inter), sans-serif;
+    line-height: 2.1; /* Nastaliq needs much more vertical space */
+  }
+}
+
+/* ─── Custom scrollbar (thin, subtle, on-brand) ─────────────────────────── */
+.scroll-thin::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+.scroll-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: oklch(0.85 0.02 145);
+  border-radius: 9999px;
+}
+.scroll-thin::-webkit-scrollbar-thumb:hover {
+  background: oklch(0.75 0.04 162);
+}
+
+/* ─── Animations ────────────────────────────────────────────────────────── */
+@keyframes aria-fade-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-up {
+  animation: aria-fade-up 0.32s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes aria-typing {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+  30%           { transform: translateY(-4px); opacity: 1; }
+}
+.animate-typing {
+  animation: aria-typing 1.2s infinite ease-in-out;
+}
+
+@keyframes aria-pulse-ring {
+  0%   { transform: scale(0.9); opacity: 0.7; }
+  70%  { transform: scale(2.2); opacity: 0; }
+  100% { transform: scale(2.2); opacity: 0; }
+}
+.animate-pulse-ring {
+  animation: aria-pulse-ring 2s infinite cubic-bezier(0.4, 0, 0.6, 1);
+}
+
+@keyframes aria-success-pop {
+  0%   { transform: scale(0); opacity: 0; }
+  60%  { transform: scale(1.15); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+.animate-success-pop {
+  animation: aria-success-pop 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Safe area helpers for iOS notch / home indicator */
+.safe-top    { padding-top: env(safe-area-inset-top); }
+.safe-bottom { padding-bottom: env(safe-area-inset-bottom); }
