@@ -54,7 +54,7 @@ export default function AriaWidgetPage() {
       setError(null);
 
       // 1. Show user message immediately
-      const newMessages = [...messages, { id: Date.now().toString(), role: 'user', content: userText, timestamp: Date.now() }];
+      const newMessages = [...messages, { id: Date.now().toString(), role: 'user' as const, content: userText, timestamp: Date.now() }];
       setMessages(newMessages);
       setIsTyping(true);
 
@@ -75,7 +75,7 @@ export default function AriaWidgetPage() {
           if (data.session_token) setSessionToken(data.session_token);
 
           // 2. Show Aria's reply
-          setMessages([...newMessages, { id: Date.now().toString() + "aria", role: 'assistant', content: data.reply, timestamp: Date.now() }]);
+          setMessages([...newMessages, { id: Date.now().toString() + "aria", role: 'assistant' as const, content: data.reply, timestamp: Date.now() }]);
 
           if (data.booking_complete) {
             alert(`Success! Confirmation Code: ${data.confirmation_code}`);
